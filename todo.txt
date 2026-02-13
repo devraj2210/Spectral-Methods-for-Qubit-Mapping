@@ -1,0 +1,87 @@
+Original: Graph -> create layout using spectral decomp -> count swaps
+
+New: Graph -> Expander\cluster decomposition  -> create layout using SC 
+     -> count swaps -> compare maxcut soln with undecomposed graph
+
+
+
+* Expander Decompostion: once we have an expander decompostion 
+(an array of sets of vertices), map the nodes in each component to 
+close-by qubits, also check which components are next to each other
+and put those close-by as well.
+
+
+try for topology:
+* n- nearest - how to map?
+* layers connected by few edges - already being done (ancilla qubits are used, 
+                                                       although not specfied in initial layout)
+
+circuit optimization
+* gate operation ordering
+-- according to the layout, see if any adjacent qubits have an edge between them, 
+if yes, apply the Rzz's on them and the non-adjacent ones later on -> giving some benefit, but not surpassing SABRE
+
+
+
+
+-- sparsification then clustering / vice versa
+* separate into clusters, make the clusters sparse / tree\path-like
+(incorporate dense topology -> path??)
+
+graph -> tree
+
+count swaps in tree (good) -> check cut value in tree circuit
+count swaps in graph (not good)
+
+
+
+
+-- euclidean paths
+
+
+
+
+** MAXCUT on trees is trivial -> maxcut value == n-1 (number of edges)
+there exists a spanning tree of the graph whose bipartitioning gives the maxcut of the graph
+
+-- doing layout, SABRE doing routing , scheduling?
+
+
+
+
+
+
+
+
+
+
+
+
+* try using more laplacian eigenvectors? what to do afterwards, cluster and then paths within cluster
+
+going foward with the graph:
+* deal with the paths connecting the clusters
+* treat the clusters as subproblems?????
+* maybe extract clusters from within the cluster (recursive)?
+ Extracting paths within the cluster?
+
+
+ -- what kind of RST is the best for use of fiedler sorting
+ -- bounded degree bfs tree, use of dummy nodes to get to all nodes
+
+
+
+
+- VF2PostLayout changes mapping in the end (only for more qubits >10)
+- make a graph with ecrs vs nodes in final circuit
+- although similar depth and ecrs, still more effect of noise
+
+
+- start dfs traversal from qubit with least degree (on the boundary)
+
+- dfs 'spanning' tree
+- mention the sparsity of the hardware topology to highlight the need of dfs tree of graph
+- mention the machine for the simulations
+- mention opt level 3/0
+- check if quantum computers scale linearly with graph size
+- future studies TSP?
