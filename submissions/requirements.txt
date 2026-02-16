@@ -1,0 +1,8 @@
+numpy
+scipy
+networkx
+matplotlib
+tqdm
+
+qiskit
+qiskit-ibm-runtime
