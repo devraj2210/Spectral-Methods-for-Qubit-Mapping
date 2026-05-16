@@ -213,18 +213,18 @@ def return_ops_all_methods(
         else:
             graph = barabasi_albert_graph(n=n, m=param, seed=0)
 
-        # Create QAOA circuit (unmapped)
-        gen = gen_QAOA_circuit(graph, reps=reps)
-
-        # proposed circuit
-        prop = custom_qaoa_ansatz(graph, fiedler_mapping, backend.coupling_map, reps=reps)
-
         fiedler_mapping = fiedler_ordered_mapping(graph, backend, noise_aware=noise_aware, normalized=normalize_laplacian)
         trivial_mapping = {i: i for i in range(n)}
         assign_mappings = {
             f"SAM{k}": spectral_assignment_mapping(graph, backend, k=k, noise_aware=noise_aware, normalized=normalize_laplacian)
             for k in k_list
         }
+
+        # Create QAOA circuit (unmapped)
+        gen = gen_QAOA_circuit(graph, reps=reps)
+
+        # proposed circuit
+        prop = custom_qaoa_ansatz(graph, fiedler_mapping, backend.coupling_map, reps=reps)
 
         # Circuit Execution & Counting
         if stop_after_routing:
