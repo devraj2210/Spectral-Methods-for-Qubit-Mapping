@@ -137,7 +137,112 @@ def get_coupling_graph(backend, weighted=False):
                 G.add_edge(q1, q2, weight=max(reliability, 0))
     else:
         G.add_edges_from(edges)
-    return G
+
+    # ---- Identify Source Node with Highest Average Edge Reliability ----
+    best_node = None
+    max_avg_reliability = -1
+
+    for node in G.nodes():
+        degree = G.degree(node)
+        if degree > 0:
+            # Sum the weights of all edges connected to the node. 
+            # If the graph is unweighted, it defaults the edge weight to 1.0.
+            total_reliability = sum(weight for _, _, weight in G.edges(node, data='weight', default=1.0))
+            avg_reliability = total_reliability / degree
+            
+            if avg_reliability > max_avg_reliability:
+                max_avg_reliability = avg_reliability
+                best_node = node
+        elif best_node is None:
+            # Fallback for an isolated node, if any exist in the topology
+            best_node = node 
+
+    return G, best_node
+    # return G
+
+# import networkx as nx
+# import numpy as np
+
+# def get_coupling_graph(backend, weighted=False):
+#     edges = backend.configuration().coupling_map
+#     G = nx.Graph()
+    
+#     if weighted:
+#         props = backend.properties()
+#         conf = backend.configuration()
+
+#         alpha = 0.75
+#         beta_readout = 0.7
+#         beta_t12 = 0.2
+#         beta_gate = 0.1
+
+#         # ---- Node (1Q) noise ----
+#         node_noise = {}
+#         for q in range(conf.num_qubits):
+#             qb = props.qubits[q]
+#             t1 = 100e6
+#             t2 = 100e6
+#             readout_err = 0
+            
+#             for p in qb:
+#                 if p.name == 'T1' and p.value > 0:
+#                     t1 = p.value
+#                 elif p.name == 'T2' and p.value > 0:
+#                     t2 = p.value
+#                 elif p.name == 'readout_error':
+#                     readout_err = p.value
+                    
+#             decoh = (1 / t1 + 1 / t2) if t1 > 0 and t2 > 0 else 0
+#             gate_errs = [
+#                 param.value
+#                 for g in props.gates
+#                 if len(g.qubits) == 1 and g.qubits[0] == q
+#                 for param in g.parameters
+#                 if param.name == "gate_error"
+#             ]
+            
+#             max_gate_err = np.mean(gate_errs) if gate_errs else 0
+#             node_noise[q] = (
+#                 beta_readout * readout_err
+#                 + beta_t12 * decoh
+#                 + beta_gate * max_gate_err
+#             )
+            
+#             G.add_node(q, weight=max(1 - node_noise[q], 0))
+
+#         # ---- Edge (2Q) noise ----
+#         for g in props.gates:
+#             if len(g.qubits) == 2:
+#                 q1, q2 = g.qubits
+#                 err = next(param.value for param in g.parameters if param.name == "gate_error")
+#                 node_term = (node_noise[q1] + node_noise[q2]) / 2
+#                 combined_noise = alpha * err + (1 - alpha) * node_term
+#                 reliability = 1 - combined_noise
+                
+#                 G.add_edge(q1, q2, weight=max(reliability, 0))
+#     else:
+#         G.add_edges_from(edges)
+
+#     # ---- Identify Source Node with Highest Average Edge Reliability ----
+#     best_node = None
+#     max_avg_reliability = -1
+
+#     for node in G.nodes():
+#         degree = G.degree(node)
+#         if degree > 0:
+#             # Sum the weights of all edges connected to the node. 
+#             # If the graph is unweighted, it defaults the edge weight to 1.0.
+#             total_reliability = sum(weight for _, _, weight in G.edges(node, data='weight', default=1.0))
+#             avg_reliability = total_reliability / degree
+            
+#             if avg_reliability > max_avg_reliability:
+#                 max_avg_reliability = avg_reliability
+#                 best_node = node
+#         elif best_node is None:
+#             # Fallback for an isolated node, if any exist in the topology
+#             best_node = node 
+
+#     return G, best_node
 
 def find_linear_chain(backend, target_length):
     '''For small target_length, find a linear chain of that length in the coupling graph.'''
@@ -327,12 +432,13 @@ def initial_layout(graph, backend, how='fiedler', topology='tree_dfs', root_on_b
             chain = find_linear_chain(backend, num_nodes)
         else:
             if noise_aware:
-                G = get_coupling_graph(backend, weighted=True)
+                G, best_node = get_coupling_graph(backend, weighted=True)
+                root_on_backend = best_node
             else:
                 G = get_coupling_graph(backend)
-            if not root_on_backend:
                 root_on_backend = central_node(G)
-            
+            # if not root_on_backend:
+
             if noise_aware:
                 tree_layout = selective_bfs(G, source=root_on_backend, n=num_nodes)
             else:
@@ -360,7 +466,7 @@ def initial_layout(graph, backend, how='fiedler', topology='tree_dfs', root_on_b
 
 def sabre_layout(circuit:QuantumCircuit, backend):
     '''Compute an initial layout using SABRE's layout pass, without routing.'''
-    circuit = transpile(circuit, basis_gates=backend.basis_gates, seed_transpiler=0)
+    # circuit = transpile(circuit, basis_gates=backend.basis_gates, seed_transpiler=0)
     pm = PassManager()
     pm.append(SabreLayout(backend.coupling_map, skip_routing=True, seed=0))
     pm.run(circuit)
@@ -397,10 +503,7 @@ def get_hamiltonian(graph):
 
 def sabre_routed_circuit(circuit:QuantumCircuit, backend, swap_heuristic='lookahead', opt_level=3):
     '''Transpile the circuit using a custom SABRE-based routing pipeline.'''
-    basis_gates=backend.basis_gates
     coupling_map = backend.coupling_map
-
-    basis_change = transpile(circuit, basis_gates=basis_gates, optimization_level=opt_level, seed_transpiler=0)
 
     pm = PassManager([
         # SetLayout(initial_layout),
@@ -412,7 +515,7 @@ def sabre_routed_circuit(circuit:QuantumCircuit, backend, swap_heuristic='lookah
     ])
 
     # Transpile using the custom pipeline
-    transpiled = pm.run(basis_change)
+    transpiled = pm.run(circuit)
     return transpiled
 
 def gen_QAOA_circuit(graph:nx.Graph, reps=2):
@@ -436,8 +539,7 @@ def custom_routed_circuit(circuit : QuantumCircuit, initial_mapping, backend, sw
         SabreSwap(coupling_map, heuristic=swap_heuristic),
     ])
 
-    basis_change = transpile(circuit, basis_gates=basis_gates, optimization_level=opt_level, seed_transpiler=0)
-    transpiled = pm.run(basis_change)
+    transpiled = pm.run(circuit)
 
     return transpiled
 
@@ -486,9 +588,10 @@ def fiedler_ordered_mapping(graph:nx.Graph, backend, noise_aware=False, normaliz
     '''Compute a layout based on Fiedler ordering and a BFS/DFS tree.'''
     num_nodes = graph.number_of_nodes()
     if noise_aware:
-        G = get_coupling_graph(backend, weighted=True)
-        high_degree_nodes = [u for u in G.nodes if G.degree(u) >= 3]
-        root_on_backend = max(high_degree_nodes, key=lambda q: G.nodes[q]["weight"])
+        G, best_node = get_coupling_graph(backend, weighted=True)
+        # high_degree_nodes = [u for u in G.nodes if G.degree(u) >= 3]
+        # root_on_backend = max(high_degree_nodes, key=lambda q: G.nodes[q]["weight"])
+        root_on_backend = best_node
     else:
         G = get_coupling_graph(backend)
         root_on_backend = backend.number_of_qubits // 2
@@ -509,9 +612,10 @@ def spectral_assignment_mapping(graph:nx.Graph, backend, k=2, noise_aware=False,
     '''Compute a layout by directly matching spectral embeddings of the problem and coupling graphs.'''
     num_nodes = graph.number_of_nodes()
     if noise_aware:
-        G = get_coupling_graph(backend, weighted=True)
-        high_degree_nodes = [u for u in G.nodes if G.degree(u) >= 3]
-        root_on_backend = max(high_degree_nodes, key=lambda q: G.nodes[q]["weight"])
+        G, best_node = get_coupling_graph(backend, weighted=True)
+        # high_degree_nodes = [u for u in G.nodes if G.degree(u) >= 3]
+        # root_on_backend = max(high_degree_nodes, key=lambda q: G.nodes[q]["weight"])
+        root_on_backend = best_node
     else:
         G = get_coupling_graph(backend)
         root_on_backend = backend.number_of_qubits // 2

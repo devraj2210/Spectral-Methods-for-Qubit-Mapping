@@ -5,8 +5,9 @@ import networkx as nx
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 from collections import defaultdict
+from time import perf_counter
 
-from qiskit import QuantumCircuit
+from qiskit import QuantumCircuit, transpile
 from qiskit.quantum_info import SparsePauliOp
 from qiskit_ibm_runtime import Session, EstimatorV2 as Estimator
 from qiskit_ibm_runtime import SamplerV2 as Sampler
@@ -17,11 +18,11 @@ from implementation import (
     graph_laplacian_embedding,
     fiedler_ordered_mapping,
     spectral_assignment_mapping,
+    sabre_layout,
     custom_qaoa_ansatz,
     get_hamiltonian,
     gen_QAOA_circuit,
     custom_routed_circuit,
-    sabre_routed_circuit,
     final_optimized_circuit
 )
 
@@ -137,6 +138,70 @@ def gradient_graph(graph : nx.Graph, normalized=False, tree=None, title=None, fl
         plt.title(title)
     plt.show()
 
+from collections import defaultdict
+import rustworkx as rx
+
+from qiskit.transpiler import CouplingMap
+from qiskit.transpiler.passes.routing.commuting_2q_gate_routing import SwapStrategy
+
+from sat_mapping import SATMapper
+
+
+def extract_longest_chain(backend):
+    """
+    Extracts an approximate longest simple path from the backend coupling graph.
+    Works well for heavy-hex architectures.
+    """
+
+    coupling = backend.coupling_map.get_edges()
+
+    G = nx.Graph()
+    G.add_edges_from(coupling)
+
+    # two-sweep heuristic
+    start = list(G.nodes())[0]
+
+    lengths = nx.single_source_shortest_path_length(G, start)
+    u = max(lengths, key=lengths.get)
+
+    lengths = nx.single_source_shortest_path_length(G, u)
+    v = max(lengths, key=lengths.get)
+
+    path = nx.shortest_path(G, u, v)
+
+    return path
+
+
+def build_line_swap_strategy(chain):
+    """
+    Creates a line swap strategy over a chain of qubits.
+    """
+
+    line_edges = [(chain[i], chain[i+1]) for i in range(len(chain)-1)]
+
+    cmap = CouplingMap(line_edges)
+
+    return SwapStrategy.from_line([q for q in chain])
+
+
+def sat_line_mapping(graph, backend, timeout=30):
+    """
+    SAT-based initial mapping using longest heavy-hex chain.
+    """
+
+    chain = extract_longest_chain(backend)
+
+    strategy = build_line_swap_strategy(chain)
+
+    mapper = SATMapper(timeout=timeout)
+
+    _, edge_map, layers = mapper.remap_graph_with_sat(
+        graph,
+        strategy
+    )
+
+    return edge_map, layers
+
 def return_ops(backend, graph_type='reg', param=4, average_over=5, node_list=list(range(10,101,2)), reps=2, tech='1D', k=2, opt_level=3, op_name='ecr', stop_after_routing=False, normalize_laplacian=True, noise_aware=False):
     swaps = {'means': {'SABRE':[], 'Proposed':[], 'Trivial':[], 'Random':[]},
              'stddevs': {'SABRE':[], 'Proposed':[], 'Trivial':[], 'Random':[]}}
@@ -158,12 +223,8 @@ def return_ops(backend, graph_type='reg', param=4, average_over=5, node_list=lis
         gen = gen_QAOA_circuit(graph, reps=reps) # for sabre
         prop = custom_qaoa_ansatz(graph, proposed_mapping, backend.coupling_map, reps=reps) # for proposed mapping
         
-        if stop_after_routing:
-            func_with_mapping = custom_routed_circuit
-            func_sabre = sabre_routed_circuit
-        else:
-            func_with_mapping = final_optimized_circuit
-            func_sabre = final_optimized_circuit
+        func_with_mapping = final_optimized_circuit
+        func_sabre = final_optimized_circuit
 
         for _ in range(average_over):
             swap_avg['fied'].append(func_with_mapping(circuit=prop, backend=backend, initial_mapping=proposed_mapping, opt_level=opt_level).count_ops().get(op_name, 0))
@@ -181,6 +242,35 @@ def return_ops(backend, graph_type='reg', param=4, average_over=5, node_list=lis
 
     return swaps
 
+def get_metric(circuit, metric="swap_count", op_name="swap"):
+
+    if metric == "swap_count":
+        return circuit.count_ops().get(op_name, 0)
+
+    elif metric == "depth":
+        return circuit.depth()
+
+    elif metric == "two_qubit_depth":
+        return circuit.depth(
+            filter_function=lambda inst:
+                inst.operation.num_qubits == 2
+        )
+
+    elif metric == "two_qubit_gate_count":
+        return sum(
+            instruction.operation.num_qubits == 2
+            for instruction in circuit.data
+        )
+
+    elif metric == "swap_depth":
+        return circuit.depth(
+            filter_function=lambda inst:
+                inst.operation.name == op_name
+        )
+
+    else:
+        raise ValueError(f"Unknown metric: {metric}")
+
 def return_ops_all_methods(
     backend,
     graph_type='reg',
@@ -189,83 +279,312 @@ def return_ops_all_methods(
     node_list=list(range(10,101,2)),
     k_list=[2,3,5],
     reps=2,
-    opt_level=1,
     op_name='ecr',
     stop_after_routing=False,
-    normalize_laplacian=True,
     noise_aware=False,
+    metric="swap_count",
+    opt_levels=None,
 ):
-    methods = ["SABRE", "Trivial", "FOM"]
-    for k in k_list:
-        methods.append(f"SAM{k}")
-    
-    swaps = {
-        'means': {m: [] for m in methods},
-        'stddevs': {m: [] for m in methods}
+    """Collect routed SWAP counts and optimized circuit metrics only.
+
+    SWAPs are counted on custom_routed_circuit. Two-qubit gate counts and
+    depths are counted on final_optimized_circuit at each requested level.
+    ``opt_level`` and ``stop_after_routing`` remain accepted for compatibility;
+    pass ``opt_levels`` to collect multiple optimization levels.
+    """
+    methods = ["SABRE", "Trivial", "FOM"] + [f"SAM{k}" for k in k_list]
+    multiple_levels_requested = opt_levels is not None
+    opt_levels = list(dict.fromkeys(opt_levels if multiple_levels_requested else [1]))
+    if not opt_levels:
+        raise ValueError("opt_levels must contain at least one optimization level")
+    if average_over < 1:
+        raise ValueError("average_over must be at least 1")
+    if graph_type not in {'reg', 'ba'}:
+        raise ValueError("graph_type must be 'reg' or 'ba'")
+
+    swaps_samples = {method: [] for method in methods}
+    two_qubit_samples = {
+        str(level): {method: [] for method in methods} for level in opt_levels
+    }
+    depth_samples = {
+        str(level): {method: [] for method in methods} for level in opt_levels
     }
 
-    for n in tqdm(node_list, desc=f'Iterating for number of nodes', leave=False):
-        swap_avg = {m: [] for m in methods}
+    def summarize(per_method):
+        return {
+            'means': {
+                method: [float(np.mean(values)) for values in node_values]
+                for method, node_values in per_method.items()
+            },
+            'stddevs': {
+                method: [float(np.std(values)) for values in node_values]
+                for method, node_values in per_method.items()
+            },
+            'medians': {
+                method: [float(np.median(values)) for values in node_values]
+                for method, node_values in per_method.items()
+            },
+        }
 
-        # Generate problem graph
-        if graph_type == 'reg':
-            graph = nx.random_regular_graph(n=n, d=param, seed=0)
-        else:
-            graph = barabasi_albert_graph(n=n, m=param, seed=0)
-
-        fiedler_mapping = fiedler_ordered_mapping(graph, backend, noise_aware=noise_aware, normalized=normalize_laplacian)
+    for n in tqdm(node_list, desc=f'Collecting circuit ops (param={param})', leave=False):
+        graph = (
+            nx.random_regular_graph(n=n, d=param, seed=0)
+            if graph_type == 'reg'
+            else barabasi_albert_graph(n=n, m=param, seed=0)
+        )
+        fiedler_mapping = fiedler_ordered_mapping(
+            graph, backend, noise_aware=noise_aware, normalized=False,
+        )
         trivial_mapping = {i: i for i in range(n)}
         assign_mappings = {
-            f"SAM{k}": spectral_assignment_mapping(graph, backend, k=k, noise_aware=noise_aware, normalized=normalize_laplacian)
+            f"SAM{k}": spectral_assignment_mapping(
+                graph, backend, k=k, noise_aware=noise_aware, normalized=True,
+            )
             for k in k_list
         }
 
-        # Create QAOA circuit (unmapped)
-        gen = gen_QAOA_circuit(graph, reps=reps)
-
-        # proposed circuit
-        prop = custom_qaoa_ansatz(graph, fiedler_mapping, backend.coupling_map, reps=reps)
-
-        # Circuit Execution & Counting
-        if stop_after_routing:
-            exec_map_func = custom_routed_circuit
-            exec_sabre_func = sabre_routed_circuit
-        else:
-            exec_map_func = final_optimized_circuit
-            exec_sabre_func = final_optimized_circuit
-
-        for i in range(average_over):
-            # Fiedler
-            swap_avg['FOM'].append(
-                exec_map_func(circuit=prop, 
-                              backend=backend, initial_mapping=fiedler_mapping, opt_level=opt_level).count_ops().get(op_name, 0)
+        generic = transpile(
+            gen_QAOA_circuit(graph, reps=reps),
+            basis_gates=backend.basis_gates, seed_transpiler=0,
+        )
+        fiedler_circuit = transpile(
+            custom_qaoa_ansatz(graph, fiedler_mapping, backend.coupling_map, reps=reps),
+            basis_gates=backend.basis_gates, seed_transpiler=0,
+        )
+        sam_circuits = {
+            f"SAM{k}": transpile(
+                custom_qaoa_ansatz(
+                    graph, assign_mappings[f"SAM{k}"], backend.coupling_map, reps=reps,
+                ),
+                basis_gates=backend.basis_gates, seed_transpiler=0,
             )
-        
-            # SAM with different k
-            for k in k_list:
-                key = f"SAM{k}"
-                swap_avg[key].append(
-                    exec_map_func(circuit=prop, 
-                                  backend=backend, initial_mapping=assign_mappings[f"SAM{k}"], opt_level=opt_level).count_ops().get(op_name, 0)
+            for k in k_list
+        }
+        method_inputs = {
+            'SABRE': (generic, sabre_layout(generic.copy(), backend)),
+            'Trivial': (generic, trivial_mapping),
+            'FOM': (fiedler_circuit, fiedler_mapping),
+        }
+        method_inputs.update({
+            method: (sam_circuits[method], assign_mappings[method])
+            for method in sam_circuits
+        })
+
+        node_swaps = {method: [] for method in methods}
+        node_two_qubit = {
+            str(level): {method: [] for method in methods} for level in opt_levels
+        }
+        node_depth = {
+            str(level): {method: [] for method in methods} for level in opt_levels
+        }
+        for _ in range(average_over):
+            for method, (circuit, mapping) in method_inputs.items():
+                routed = custom_routed_circuit(circuit.copy(), mapping, backend)
+                node_swaps[method].append(
+                    get_metric(routed, metric='swap_count', op_name='swap')
                 )
+                for level in opt_levels:
+                    key = str(level)
+                    optimized = final_optimized_circuit(
+                        circuit.copy(), backend, initial_mapping=mapping,
+                        opt_level=level,
+                    )
+                    node_two_qubit[key][method].append(
+                        get_metric(optimized, metric='two_qubit_gate_count')
+                    )
+                    node_depth[key][method].append(
+                        get_metric(optimized, metric='depth')
+                    )
 
-            # Trivial
-            swap_avg['Trivial'].append(
-                exec_map_func(circuit=gen, backend=backend, initial_mapping=trivial_mapping, opt_level=opt_level).count_ops().get(op_name, 0)
+        for method in methods:
+            swaps_samples[method].append(node_swaps[method])
+            for level in opt_levels:
+                key = str(level)
+                two_qubit_samples[key][method].append(node_two_qubit[key][method])
+                depth_samples[key][method].append(node_depth[key][method])
+
+    first_level = str(opt_levels[0])
+    results = {
+        'swaps': summarize(swaps_samples),
+        'two_qubit_gates': {
+            level: summarize(two_qubit_samples[level]) for level in two_qubit_samples
+        },
+        'circuit_depth': {
+            level: summarize(depth_samples[level]) for level in depth_samples
+        },
+    }
+    first_level_two_qubit = results['two_qubit_gates'][first_level]
+    first_level_depth = results['circuit_depth'][first_level]
+    if not multiple_levels_requested:
+        results['two_qubit_gates'] = first_level_two_qubit
+        results['circuit_depth'] = first_level_depth
+    if metric == 'depth':
+        legacy_view = first_level_depth
+    elif metric in {'two_qubit_gate_count', 'two_qubit_gates'}:
+        legacy_view = first_level_two_qubit
+    elif stop_after_routing or op_name == 'swap':
+        legacy_view = results['swaps']
+    else:
+        legacy_view = results['two_qubit_gates'][str(opt_levels[0])]
+    results['means'] = legacy_view['means']
+    results['stddevs'] = legacy_view['stddevs']
+    return results
+
+
+def return_times_all_methods(
+    backend, graph_type='reg', param=4, average_over=5,
+    node_list=list(range(10, 101, 2)), k_list=[2, 3, 5], reps=2,
+    noise_aware=False, opt_levels=None,
+):
+    """Measure mapping and final compilation time without collecting ops."""
+    k_list = list(dict.fromkeys(k_list))
+    multiple_levels_requested = opt_levels is not None
+    opt_levels = list(dict.fromkeys(opt_levels if multiple_levels_requested else [1]))
+    if not opt_levels:
+        raise ValueError("opt_levels must contain at least one optimization level")
+    if average_over < 1:
+        raise ValueError("average_over must be at least 1")
+    if graph_type not in {'reg', 'ba'}:
+        raise ValueError("graph_type must be 'reg' or 'ba'")
+
+    methods = ["SABRE", "Trivial", "FOM"] + [f"SAM{k}" for k in k_list]
+    level_keys = [str(level) for level in opt_levels]
+    samples = {
+        'mapping_time': {method: [] for method in methods},
+        'routing_optimization_time': {
+            level: {method: [] for method in methods} for level in level_keys
+        },
+        'total_compilation_time': {
+            level: {method: [] for method in methods} for level in level_keys
+        },
+    }
+
+    def timed(fn, *args, **kwargs):
+        start = perf_counter()
+        result = fn(*args, **kwargs)
+        return result, perf_counter() - start
+
+    def summarize(per_method):
+        summary = {
+            'means': {}, 'stddevs': {}, 'medians': {}, 'trimmed_means': {},
+            'q25': {}, 'q75': {}, 'iqrs': {},
+        }
+        for method, node_samples in per_method.items():
+            def trimmed_mean(values):
+                ordered = np.sort(np.asarray(values, dtype=float))
+                return float(np.mean(ordered[1:-1] if len(ordered) >= 3 else ordered))
+            summary['means'][method] = [float(np.mean(x)) for x in node_samples]
+            summary['stddevs'][method] = [float(np.std(x)) for x in node_samples]
+            summary['medians'][method] = [float(np.median(x)) for x in node_samples]
+            summary['trimmed_means'][method] = [trimmed_mean(x) for x in node_samples]
+            summary['q25'][method] = [float(np.quantile(x, .25)) for x in node_samples]
+            summary['q75'][method] = [float(np.quantile(x, .75)) for x in node_samples]
+            summary['iqrs'][method] = [
+                float(np.quantile(x, .75) - np.quantile(x, .25))
+                for x in node_samples
+            ]
+        return summary
+
+    for n in tqdm(node_list, desc=f'Timing compilation (param={param})', leave=False):
+        graph = (
+            nx.random_regular_graph(n=n, d=param, seed=0)
+            if graph_type == 'reg'
+            else barabasi_albert_graph(n=n, m=param, seed=0)
+        )
+        node_samples = {
+            'mapping_time': {method: [] for method in methods},
+            'routing_optimization_time': {
+                level: {method: [] for method in methods} for level in level_keys
+            },
+            'total_compilation_time': {
+                level: {method: [] for method in methods} for level in level_keys
+            },
+        }
+
+        for _ in range(average_over):
+            # Circuit generation and basis transpilation are outside the timers.
+            generic = transpile(
+                gen_QAOA_circuit(graph, reps=reps),
+                basis_gates=backend.basis_gates, seed_transpiler=0,
             )
-
-            # SABRE
-            swap_avg['SABRE'].append(
-                exec_sabre_func(circuit=gen, backend=backend, opt_level=opt_level).count_ops().get(op_name, 0)
+            trivial_mapping, trivial_time = timed(lambda: {i: i for i in range(n)})
+            fom_mapping, fom_time = timed(
+                fiedler_ordered_mapping, graph, backend,
+                noise_aware=noise_aware, normalized=False,
             )
+            fom_circuit = transpile(
+                custom_qaoa_ansatz(graph, fom_mapping, backend.coupling_map, reps=reps),
+                basis_gates=backend.basis_gates, seed_transpiler=0,
+            )
+            method_inputs = {
+                'Trivial': (generic, trivial_mapping, trivial_time),
+                'FOM': (fom_circuit, fom_mapping, fom_time),
+            }
 
-        # Statistical Results
-        for m in methods:
-            key = m
-            swaps['means'][m].append(np.mean(swap_avg[key]))
-            swaps['stddevs'][m].append(np.std(swap_avg[key]))
+            for k in k_list:
+                method = f"SAM{k}"
+                mapping, mapping_time = timed(
+                    spectral_assignment_mapping, graph, backend, k=k,
+                    noise_aware=noise_aware, normalized=True,
+                )
+                circuit = transpile(
+                    custom_qaoa_ansatz(graph, mapping, backend.coupling_map, reps=reps),
+                    basis_gates=backend.basis_gates, seed_transpiler=0,
+                )
+                method_inputs[method] = (circuit, mapping, mapping_time)
 
-    return swaps
+            sabre_circuit = transpile(
+                gen_QAOA_circuit(graph, reps=reps),
+                basis_gates=backend.basis_gates, seed_transpiler=0,
+            )
+            sabre_mapping, sabre_time = timed(sabre_layout, sabre_circuit, backend)
+            method_inputs['SABRE'] = (sabre_circuit, sabre_mapping, sabre_time)
+
+            for method, (circuit, mapping, mapping_time) in method_inputs.items():
+                node_samples['mapping_time'][method].append(mapping_time)
+                for level in opt_levels:
+                    level_key = str(level)
+                    _, route_opt_time = timed(
+                        final_optimized_circuit,
+                        circuit.copy(), backend, initial_mapping=mapping,
+                        opt_level=level,
+                    )
+                    node_samples['routing_optimization_time'][level_key][method].append(
+                        route_opt_time
+                    )
+                    node_samples['total_compilation_time'][level_key][method].append(
+                        mapping_time + route_opt_time
+                    )
+
+        for method in methods:
+            samples['mapping_time'][method].append(node_samples['mapping_time'][method])
+            for level in level_keys:
+                for stage in ('routing_optimization_time', 'total_compilation_time'):
+                    samples[stage][level][method].append(
+                        node_samples[stage][level][method]
+                    )
+
+    mapping_summary = summarize(samples['mapping_time'])
+    route_opt_summaries = {
+        level: summarize(samples['routing_optimization_time'][level])
+        for level in level_keys
+    }
+    total_summaries = {
+        level: summarize(samples['total_compilation_time'][level])
+        for level in level_keys
+    }
+    if not multiple_levels_requested:
+        return {
+            'mapping_time': mapping_summary,
+            'routing_optimization_time': route_opt_summaries[level_keys[0]],
+            'total_compilation_time': total_summaries[level_keys[0]],
+        }
+    return {
+        'mapping_time': mapping_summary,
+        'routing_optimization_time': route_opt_summaries,
+        'total_compilation_time': total_summaries,
+    }
+
 
 # Colors for consistency across plots
 colors = {
@@ -278,52 +597,83 @@ colors = {
     "SAM4": "#CC79A7"
 }
 
-def plot_swap_results(swaps_dict, node_list, k_list, params, zoom=None, title_prefix="", ylabel="SWAP Count"):
+def plot_metric_results(results_dict, node_list, k_list, params, metric,
+                        zoom=None, title_prefix="", ylabel=None, fill_between=True, plot='mean'):
     """
-    swaps_dict: swap statistics returned from return_ops_all_methods()
+    results_dict: statistics returned from return_ops_all_methods(), indexed by param
     node_list: list of graph sizes tested (x-axis)
     params: list of values used for graph param (ex: degrees or m attachments)
+    metric: a result key or dotted path, e.g. "swaps" or
+        "execution_time.stop_after_routing"
     """
+    metric_label = metric.split(".")[-1].replace("_", " ").title() if metric else "Metric"
+    if ylabel is None:
+        ylabel = metric_label
+
     methods = ["SABRE", "Trivial", "FOM"]
     for k in k_list:
         methods.append(f"SAM{k}")
+
     if zoom:
         node_list=node_list[:zoom]
+
     for param in params:
         plt.figure(figsize=(9, 6))
-        
+
+        metric_stats = results_dict[param]
+        if metric:
+            for path_part in metric.split("."):
+                metric_stats = metric_stats[path_part]
+
         for method in methods:
-            means=swaps_dict[param]['means'][method]
-            stds=swaps_dict[param]['stddevs'][method]
+            means=metric_stats['means'][method]
+            stds=metric_stats['stddevs'][method]
+            medians=metric_stats['medians'][method]
             if zoom:
                 means=means[:zoom]
                 stds=stds[:zoom]
             mean_vals = np.array(means)
             std_vals  = np.array(stds)
+            median_vals = np.array(medians)
+
             
-            plt.plot(node_list, mean_vals,
+            plt.plot(node_list, median_vals if plot == 'median' else mean_vals,
                      label=method,
                      color=colors.get(method, None),
                      linewidth=2)
 
-            plt.fill_between(node_list,
-                             mean_vals - std_vals,
-                             mean_vals + std_vals,
-                             alpha=0.25,
-                             color=colors.get(method, None))
+            if fill_between:
+                plt.fill_between(node_list,
+                                 mean_vals - std_vals,
+                                 mean_vals + std_vals,
+                                 alpha=0.25,
+                                 color=colors.get(method, None))
 
         plt.xlabel("Number of Nodes", fontsize=18)
         plt.ylabel(ylabel, fontsize=18)
+        # All collected metrics are non-negative. Starting both axes at zero
+        # makes the chart origin explicit and avoids a misleading offset.
+        plt.xlim(left=0)
+        plt.ylim(bottom=0)
         plt.xticks(fontsize=14)
         plt.yticks(fontsize=14)
 
-        if title_prefix:
-            plt.title(f"{title_prefix} (param = {param})", fontsize=18)
+        # plot_title = title_prefix or metric_label
+        # plt.title(f"{plot_title} (param = {param})", fontsize=18)
 
         plt.grid(alpha=0.3)
         plt.legend(fontsize=14)
         plt.tight_layout()
         plt.show()
+
+
+def plot_swap_results(swaps_dict, node_list, k_list, params, zoom=None,
+                      title_prefix="", ylabel="SWAP Count"):
+    """Plot the legacy top-level means/stddevs view from the result object."""
+    plot_metric_results(
+        swaps_dict, node_list, k_list, params, metric="",
+        zoom=zoom, title_prefix=title_prefix or ylabel, ylabel=ylabel,
+    )
 
 def compute_percentage_improvement(swaps_dict, methods, baseline="SABRE"):
     """
@@ -446,6 +796,9 @@ def plot_percentage_improvements(
 
         plt.xlabel("Number of Nodes", fontsize=18)
         plt.ylabel(ylabel, fontsize=18)
+        # Node counts start at zero; percentage improvements can be negative,
+        # so only constrain the horizontal axis for these plots.
+        plt.xlim(left=0)
         plt.xticks(fontsize=14)
         plt.yticks(fontsize=14)
 
@@ -716,7 +1069,6 @@ def maxcut_results(
     opt_level=1,
     estimator_shots=1000,
     sampler_shots=1000,
-    normalize_laplacian=True,
     tech='1D',
     k=2,
     noise_aware=True,
@@ -744,10 +1096,10 @@ def maxcut_results(
             )
         else:
             if tech == '1D':
-                proposed_mapping = fiedler_ordered_mapping(graph, backend, noise_aware=noise_aware, normalized=normalize_laplacian)
+                proposed_mapping = fiedler_ordered_mapping(graph, backend, noise_aware=noise_aware, normalized=False)
 
             elif tech == '2D':
-                proposed_mapping = spectral_assignment_mapping(graph, backend, k=k, noise_aware=noise_aware, normalized=normalize_laplacian)
+                proposed_mapping = spectral_assignment_mapping(graph, backend, k=k, noise_aware=noise_aware, normalized=True)
 
             circuit = custom_qaoa_ansatz(
                 graph, proposed_mapping, backend.coupling_map, reps=reps
